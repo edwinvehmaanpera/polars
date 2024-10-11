@@ -7,6 +7,21 @@ use polars_utils::format_pl_smallstr;
 
 use crate::prelude::*;
 
+fn apply_time_add(
+    start: i64,
+    interval: &Duration,
+    i: i64,
+    tu: TimeUnit,
+    tz: Option<&Tz>
+) -> PolarsResult<i64> {
+    match tu {
+        TimeUnit::Nanoseconds => Duration::add_ns(&(*interval * i), start, tz),
+        TimeUnit::Microseconds => Duration::add_us(&(*interval * i), start, tz),
+        TimeUnit::Milliseconds => Duration::add_ms(&(*interval * i), start, tz),
+    }
+}
+
+
 pub fn in_nanoseconds_window(ndt: &NaiveDateTime) -> bool {
     // ~584 year around 1970
     !(ndt.year() > 2554 || ndt.year() < 1386)
@@ -111,47 +126,61 @@ pub(crate) fn datetime_range_i64(
         ComputeError: "`interval` must be positive"
     );
 
+    // Fast path when interval has only nsec interval component
+    if interval.weeks()==0 && interval.months() == 0 && interval.days()==0 {
+        let interval_nsec = interval.nanoseconds();
+        match closed {
+            ClosedWindow::Both => {
+                return Ok((start..end).step_by(interval_nsec as usize).collect())
+            }
+            ClosedWindow::Left => {
+                return Ok((start..end-interval_nsec).step_by(interval_nsec as usize).collect())
+            }
+            ClosedWindow::Right => {
+                return Ok((start+interval_nsec..end).step_by(interval_nsec as usize).collect())
+            }
+            ClosedWindow::None => {
+                return Ok((start+interval_nsec..end-interval_nsec).step_by(interval_nsec as usize).collect())
+            }
+        }
+    }
+    
+    let size: usize = match tu {
+        TimeUnit::Nanoseconds => ((end - start) / interval.duration_ns() + 1) as usize,
+        TimeUnit::Microseconds => ((end - start) / interval.duration_us() + 1) as usize,
+        TimeUnit::Milliseconds => ((end - start) / interval.duration_ms() + 1) as usize,
+    };
+    
     let size: usize;
     let offset_fn: fn(&Duration, i64, Option<&Tz>) -> PolarsResult<i64>;
 
-    match tu {
-        TimeUnit::Nanoseconds => {
-            size = ((end - start) / interval.duration_ns() + 1) as usize;
-            offset_fn = Duration::add_ns;
-        },
-        TimeUnit::Microseconds => {
-            size = ((end - start) / interval.duration_us() + 1) as usize;
-            offset_fn = Duration::add_us;
-        },
-        TimeUnit::Milliseconds => {
-            size = ((end - start) / interval.duration_ms() + 1) as usize;
-            offset_fn = Duration::add_ms;
-        },
-    }
     let mut ts = Vec::with_capacity(size);
 
     let mut i = match closed {
         ClosedWindow::Both | ClosedWindow::Left => 0,
         ClosedWindow::Right | ClosedWindow::None => 1,
     };
-    let mut t = offset_fn(&(interval * i), start, tz)?;
+    
+    let mut t = apply_time_add(start, &interval, i, tu, tz)?;
     i += 1;
+
     match closed {
         ClosedWindow::Both | ClosedWindow::Right => {
             while t <= end {
                 ts.push(t);
-                t = offset_fn(&(interval * i), start, tz)?;
+                t = apply_time_add(start, &interval, i, tu, tz)?;
                 i += 1;
             }
-        },
+        }
         ClosedWindow::Left | ClosedWindow::None => {
             while t < end {
                 ts.push(t);
-                t = offset_fn(&(interval * i), start, tz)?;
+                t = apply_time_add(start, &interval, i, tu, tz)?;
                 i += 1;
             }
-        },
+        }
     }
+    
     debug_assert!(size >= ts.len());
     Ok(ts)
 }
